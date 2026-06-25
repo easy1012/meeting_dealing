@@ -17,8 +17,8 @@ build/
 *.bin
 *.safetensors
 
-# 출력 파일
-rsc/output/
+# 출력 파일/데이터
+rsc/
 
 # OS
 .DS_Store
