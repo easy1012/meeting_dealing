@@ -93,13 +93,20 @@ class TranscriptCleaner:
             import torch
             from transformers import AutoModelForCausalLM, AutoTokenizer
 
+            # 이전 모델(pyannote, Whisper)이 GPU 캐시를 점유할 수 있으므로 먼저 정리
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+                torch.cuda.synchronize()
+                free_gb = torch.cuda.mem_get_info()[0] / 1e9
+                logger.info("sLLM 로드 전 GPU 여유 메모리: %.1f GB", free_gb)
+
             self._tokenizer = AutoTokenizer.from_pretrained(
                 model_id,
                 token=self.settings.hf_token or None,
             )
             self._model = AutoModelForCausalLM.from_pretrained(
                 model_id,
-                torch_dtype=torch.bfloat16,
+                dtype=torch.bfloat16,       # torch_dtype → dtype (deprecation 수정)
                 device_map="auto",
                 token=self.settings.hf_token or None,
             )
@@ -120,7 +127,14 @@ class TranscriptCleaner:
             messages,
             return_tensors="pt",
             add_generation_prompt=True,
-        ).to(self._model.device)
+        )
+
+        # meta device에 오프로드된 경우 CUDA로 강제 이동 시도
+        target_device = "cuda" if torch.cuda.is_available() else "cpu"
+        try:
+            input_ids = input_ids.to(target_device)
+        except Exception:
+            input_ids = input_ids.to("cpu")
 
         with torch.inference_mode():
             output_ids = self._model.generate(

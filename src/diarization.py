@@ -66,9 +66,9 @@ class DiarizationPipeline:
 
         self._pipeline = Pipeline.from_pretrained(
             self.settings.diarization_model,
-            use_auth_token=self.settings.hf_token,
         )
-        self._pipeline.to(self.settings.device)
+        import torch
+        self._pipeline.to(torch.device(self.settings.device))
         logger.info("화자 분리 모델 로딩 완료.")
 
     def run(
@@ -92,6 +92,39 @@ class DiarizationPipeline:
 
         logger.info("화자 분리 실행: %s", audio_path.name)
 
+        # torchaudio 2.9+가 torchcodec에 의존하므로, soundfile(libsndfile)로 직접 로드합니다.
+        # soundfile은 WAV / FLAC / OGG / AIFF 등을 ffmpeg 없이 지원합니다.
+        # MP3 / M4A 등은 지원하지 않으므로 WAV로 변환 후 사용을 권장합니다.
+        import numpy as np
+        import torch
+        import soundfile as sf
+        from scipy.signal import resample_poly
+        from math import gcd
+
+        _TARGET_SR = 16_000
+
+        try:
+            data, sr = sf.read(str(audio_path), dtype="float32", always_2d=True)
+        except Exception as exc:
+            raise RuntimeError(
+                f"오디오 파일을 읽을 수 없습니다: {audio_path.name}\n"
+                "MP3·M4A 포맷은 지원되지 않습니다. WAV / FLAC / OGG 파일을 사용하세요.\n"
+                f"(원본 오류: {exc})"
+            ) from exc
+
+        # (time, channels) → mono: 채널 평균
+        if data.ndim == 2:
+            data = data.mean(axis=1)
+
+        # 리샘플링 (원본 SR ≠ 16 kHz 인 경우)
+        if sr != _TARGET_SR:
+            g = gcd(sr, _TARGET_SR)
+            data = resample_poly(data, _TARGET_SR // g, sr // g).astype(np.float32)
+
+        # (time,) → (1, time) torch.Tensor
+        waveform = torch.from_numpy(data).unsqueeze(0)
+        audio_input = {"waveform": waveform, "sample_rate": _TARGET_SR}
+
         kwargs: dict = {}
         _min = min_speakers or self.settings.min_speakers
         _max = max_speakers or self.settings.max_speakers
@@ -100,10 +133,17 @@ class DiarizationPipeline:
         if _max is not None:
             kwargs["max_speakers"] = _max
 
-        diarization = self._pipeline(str(audio_path), **kwargs)
+        diarization = self._pipeline(audio_input, **kwargs)
+
+        # pyannote 최신 버전은 DiarizeOutput 객체를 반환합니다.
+        # 구 버전(legacy=True)은 Annotation을 바로 반환합니다.
+        if hasattr(diarization, "speaker_diarization"):
+            annotation = diarization.speaker_diarization
+        else:
+            annotation = diarization  # Annotation 직접 반환(구 API)
 
         segments: List[SpeakerSegment] = []
-        for turn, _, speaker in diarization.itertracks(yield_label=True):
+        for turn, _, speaker in annotation.itertracks(yield_label=True):
             segments.append(
                 SpeakerSegment(
                     start=turn.start,
